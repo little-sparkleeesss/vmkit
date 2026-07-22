@@ -1,0 +1,11 @@
+# 机器/敏感配置(.env 由 .example.env 复制,不入库)
+.env
+
+# 构建产物与缓存
+disks/
+logs/
+__pycache__/
+*.pyc
+
+# Alpine ISO(体积大,各自提供,经 $VMKIT_ISO/.env 指向)
+*.iso
