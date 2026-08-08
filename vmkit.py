@@ -151,37 +151,106 @@ class Console:
 
 # ===================== QEMU 启停 =====================
 class QemuVM:
-    """启动/停止一个 QEMU VM(KVM,raw 盘,串口走 unix socket)。"""
+    """启动/停止一个 QEMU VM(KVM;盘格式可配;串口走 unix socket 或 file)。
 
-    def __init__(self, name: str, *, serial_sock: str, disks=None, cdrom: str | None = None,
-                 nics=None, mem: int = 256, smp: int = 1, fw_cfg=None, extra=None,
-                 log_path: str | None = None, qemu: str = "qemu-system-x86_64"):
+    向后兼容:缺省行为与旧版一致(raw 盘、virtio NIC、unix 串口、前台 Popen)。
+    泛化(全部可选,带默认值):
+      - disks: [path,...](全部 raw) 或 [{"path","format","if","index","extra"?},...] 混合;
+        format=qcow2 的覆盖盘由 QEMU 自动读 backing。
+      - machine: 如 "q35";None 则不传。
+      - serial: 完整 -serial 参数(如 "file:/x.log");None 则由 serial_sock 拼 unix。
+      - nics[].hostfwd: 追加进 user netdev(如 "hostfwd=tcp:127.0.0.1:2222-:22")。
+      - daemonize/pidfile: 加 -daemonize -pidfile;is_alive/kill 走 pidfile。
+      - kvm/cpu/no_reboot/boot/display: 可配,缺省=现状。
+    """
+
+    def __init__(self, name: str, *, serial_sock: str | None = None, disks=None,
+                 cdrom: str | None = None, nics=None, mem: int = 256, smp: int = 1,
+                 fw_cfg=None, extra=None, log_path: str | None = None,
+                 qemu: str = "qemu-system-x86_64",
+                 machine: str | None = None, serial: str | None = None,
+                 daemonize: bool = False, pidfile: str | None = None,
+                 kvm: bool = True, cpu: str = "host", no_reboot: bool = True,
+                 boot: str | None = None, display: str = "none"):
         self.name = name
         self.serial_sock = serial_sock
         self.disks = disks or []
         self.cdrom = cdrom
-        self.nics = nics or []          # [{netdev, mac?}]
+        self.nics = nics or []          # [{netdev, mac?, hostfwd?}]
         self.mem = mem
         self.smp = smp
         self.fw_cfg = fw_cfg or []      # [(name, val, "string"|"file")] -- QEMU 通用能力,按需注入
         self.extra = extra or []
         self.log_path = log_path
         self.qemu = qemu
+        self.machine = machine
+        self.serial = serial
+        self.daemonize = daemonize
+        self.pidfile = pidfile
+        self.kvm = kvm
+        self.cpu = cpu
+        self.no_reboot = no_reboot
+        self.boot = boot
+        self.display = display
         self.proc = None
+        self.logf = None
+
+    @classmethod
+    def from_spec(cls, name: str, spec: dict):
+        """从 spec dict 构造(供 CLI `qemu start <name> <spec.json>` 等用)。"""
+        keys = ("disks", "cdrom", "nics", "mem", "smp", "fw_cfg", "extra",
+                "log_path", "qemu", "machine", "serial", "daemonize", "pidfile",
+                "kvm", "cpu", "no_reboot", "boot", "display")
+        kw = {k: spec[k] for k in keys if k in spec}
+        return cls(name, serial_sock=spec.get("serial_sock"), **kw)
+
+    def _serial_arg(self) -> str:
+        if self.serial is not None:
+            return self.serial
+        if self.serial_sock:
+            return f"unix:{self.serial_sock},server,nowait"
+        return "none"
+
+    @staticmethod
+    def _drive_arg(i: int, d) -> str:
+        """d 为路径字符串(raw)或 dict(path/format/if|bus/index/extra)。"""
+        if isinstance(d, str):
+            d = {"path": d}
+        path = d["path"]
+        fmt = d.get("format", "raw")
+        iface = d.get("if", d.get("bus", "virtio"))
+        index = d.get("index", i)
+        s = f"file={path},if={iface},format={fmt},index={index}"
+        extra = d.get("extra")
+        if extra:
+            s += f",{extra}"
+        return s
 
     def _cmd(self) -> list[str]:
-        c = [self.qemu, "-enable-kvm", "-cpu", "host",
-             "-m", str(self.mem), "-smp", str(self.smp),
-             "-display", "none", "-no-reboot", "-name", self.name,
-             "-serial", f"unix:{self.serial_sock},server,nowait",
-             "-monitor", "none"]
+        c = [self.qemu]
+        if self.kvm:
+            c += ["-enable-kvm"]
+        c += ["-cpu", self.cpu, "-m", str(self.mem), "-smp", str(self.smp),
+              "-display", self.display]
+        if self.no_reboot:
+            c += ["-no-reboot"]
+        c += ["-name", self.name, "-serial", self._serial_arg(), "-monitor", "none"]
+        if self.machine:
+            c += ["-machine", self.machine]
         for i, d in enumerate(self.disks):
-            c += ["-drive", f"file={d},if=virtio,format=raw,index={i}"]
+            c += ["-drive", self._drive_arg(i, d)]
         if self.cdrom:
-            c += ["-cdrom", self.cdrom, "-boot", "d"]
+            c += ["-cdrom", self.cdrom]
+        boot = self.boot or ("d" if self.cdrom else None)
+        if boot:
+            c += ["-boot", boot]
         for nic in self.nics:
-            c += ["-netdev", nic["netdev"]]
-            dev = f"virtio-net-pci,netdev={_netdev_id(nic['netdev'])}"
+            netdev = nic["netdev"]
+            hf = nic.get("hostfwd")
+            if hf:
+                netdev = f"{netdev},{hf}"
+            c += ["-netdev", netdev]
+            dev = f"virtio-net-pci,netdev={_netdev_id(netdev)}"
             if nic.get("mac"):
                 dev += f",mac={nic['mac']}"
             c += ["-device", dev]
@@ -190,32 +259,78 @@ class QemuVM:
                 c += ["-fw_cfg", f"name={name},string={val}"]
             else:
                 c += ["-fw_cfg", f"name={name},file={val}"]
+        if self.daemonize:
+            c += ["-daemonize"]
+        if self.pidfile:
+            c += ["-pidfile", self.pidfile]
         c += self.extra
         return c
 
+    def _read_pid(self) -> int | None:
+        if not self.pidfile:
+            return None
+        try:
+            with open(self.pidfile) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
     def start(self):
-        try: os.unlink(self.serial_sock)
-        except FileNotFoundError: pass
-        self.logf = open(self.log_path, "ab")
-        self.proc = subprocess.Popen(self._cmd(), stdout=self.logf, stderr=subprocess.STDOUT,
+        if self.serial_sock:
+            try: os.unlink(self.serial_sock)
+            except FileNotFoundError: pass
+        if self.pidfile:
+            try: os.unlink(self.pidfile)
+            except FileNotFoundError: pass
+        self.logf = open(self.log_path, "ab") if self.log_path else None
+        self.proc = subprocess.Popen(self._cmd(),
+                                     stdout=self.logf or subprocess.DEVNULL,
+                                     stderr=subprocess.STDOUT if self.logf else subprocess.DEVNULL,
                                      start_new_session=True)
+        if self.daemonize and self.pidfile:
+            # -daemonize 会二次 fork,pidfile 稍后才出现;等它(或 launcher 提前退出=失败)
+            for _ in range(50):
+                if self._read_pid() is not None:
+                    break
+                if self.proc.poll() is not None:
+                    break
+                time.sleep(0.1)
         return self.proc
 
     def is_alive(self) -> bool:
+        pid = self._read_pid()
+        if self.daemonize and pid is not None:
+            try:
+                os.kill(pid, 0)
+                return True
+            except (ProcessLookupError, PermissionError):
+                return False
         return self.proc is not None and self.proc.poll() is None
 
     def kill(self):
-        if self.proc and self.proc.poll() is None:
+        pid = self._read_pid()
+        if self.daemonize and pid is not None:
+            try: os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError): pass
+            try: os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError): pass
+        elif self.proc and self.proc.poll() is None:
             try: os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
             except ProcessLookupError: pass
-            try: self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try: os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                except Exception: pass
+        for _ in range(20):            # 等退出(最多 5s)
+            if not self.is_alive():
+                break
+            time.sleep(0.25)
+        if self.is_alive():
+            pid2 = self._read_pid() or (self.proc.pid if self.proc else None)
+            if pid2:
+                try: os.kill(pid2, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError): pass
         try: self.logf.close()
         except Exception: pass
-        try: os.unlink(self.serial_sock)
-        except FileNotFoundError: pass
+        if self.serial_sock:
+            try: os.unlink(self.serial_sock)
+            except FileNotFoundError: pass
 
 
 def _netdev_id(netdev_spec: str) -> str:
@@ -274,10 +389,98 @@ def run_cmd(con: Console, cmd: str, timeout: float = 20.0):
         con._drain(0.5)
 
 
-# ===================== base 镜像构建 =====================
-def build_base(*, out_raw: str, packages, bake_files=None, iso: str = DEFAULT_ISO,
-               apk_repos: list | None = None, mem: int = 1536, smp: int = 2,
-               size_gb: int = 2, http_port: int = 8080):
+# ===================== SSH 编排 =====================
+class SshConsole:
+    """SSH 编排(经 QEMU hostfwd 进 guest 的 sshd),与串口 Console 并存。
+
+    供 Fedora 等非 Alpine 发行版使用(如 zfs-compat 的 SSH+hostfwd 编排)。
+    依赖 host 上的 ssh/scp。串口路径仍由 Console/login_alpine/run_cmd 负责。
+    """
+
+    def __init__(self, host: str, *, port: int = 22, user: str = "root",
+                 keyfile: str | None = None, timeout: float = 20.0,
+                 strict_host_checking: bool = True):
+        """strict_host_checking: 默认 True(校验 host key)。
+        仅对本地一次性测试 VM(如 build_fedora_cloud 的 localhost)显式传 False。"""
+        self.host = host
+        self.port = port
+        self.user = user
+        self.keyfile = keyfile
+        self.timeout = timeout
+        self.strict_host_checking = strict_host_checking
+        self.opts = ["-o", "ConnectTimeout=10"]
+        if strict_host_checking:
+            self.opts += ["-o", "StrictHostKeyChecking=yes",
+                          "-o", f"UserKnownHostsFile={os.path.expanduser('~/.ssh/known_hosts')}"]
+        else:
+            self.opts += ["-o", "StrictHostKeyChecking=no",
+                          "-o", "UserKnownHostsFile=/dev/null"]
+        if keyfile:
+            self.opts += ["-i", keyfile]
+        self.dest = f"{user}@{host}"
+
+    def _ssh(self, cmd: str) -> list[str]:
+        return ["ssh"] + self.opts + ["-p", str(self.port), cmd, self.dest]
+
+    def connect(self, timeout: float | None = None):
+        """等 SSH 可连(带退避);超时抛 Timeout。"""
+        t = timeout or self.timeout
+        deadline = time.monotonic() + t
+        while True:
+            try:
+                if self.run("true", timeout=5)[1] == 0:
+                    return
+            except Timeout:
+                pass
+            if time.monotonic() > deadline:
+                raise Timeout(f"ssh connect timeout to {self.dest}:{self.port}")
+            time.sleep(1)
+
+    def run(self, cmd: str, timeout: float | None = None,
+            check: bool = False) -> tuple[str, int]:
+        """跑一条命令,返回 (去尾部空白输出, exitcode)。"""
+        to = timeout or self.timeout
+        try:
+            p = subprocess.run(self._ssh(cmd), capture_output=True, text=True, timeout=to)
+        except subprocess.TimeoutExpired:
+            raise Timeout(f"ssh cmd timeout: {cmd!r}")
+        out = (p.stdout or "").rstrip("\n")
+        if check and p.returncode != 0:
+            raise RuntimeError(f"ssh cmd failed rc={p.returncode}: {cmd!r}\n{out}")
+        return out, p.returncode
+
+    def scp_send(self, local: str, remote: str):
+        subprocess.run(["scp"] + self.opts + ["-P", str(self.port), local,
+                                              f"{self.dest}:{remote}"], check=True)
+
+    def scp_recv(self, remote: str, local: str):
+        subprocess.run(["scp"] + self.opts + ["-P", str(self.port),
+                                              f"{self.dest}:{remote}", local], check=True)
+
+
+# ===================== base 镜像构建(可插拔) =====================
+# 发行版构建器注册表:register_builder(distro, fn);build_base(distro=...) 分发。
+# 缺省 "alpine" = 旧 build_base 行为(向后兼容)。
+BUILDERS: dict[str, "Callable[..., None]"] = {}
+
+
+def register_builder(distro: str, fn) -> None:
+    BUILDERS[distro] = fn
+
+
+def build_base(*, distro: str = "alpine", **kw):
+    """分发到注册的发行版构建器。缺省 alpine(向后兼容)。
+
+    注册新发行版:def my_builder(*, out_xxx, ...): ...; vmkit.register_builder("myos", my_builder)
+    """
+    if distro not in BUILDERS:
+        raise ValueError(f"未注册的发行版构建器: {distro!r}; 已注册: {sorted(BUILDERS)}")
+    return BUILDERS[distro](**kw)
+
+
+def build_alpine(*, out_raw: str, packages, bake_files=None, iso: str = DEFAULT_ISO,
+                 apk_repos: list | None = None, mem: int = 1536, smp: int = 2,
+                 size_gb: int = 2, http_port: int = 8080):
     """构建可独立启动的 Alpine raw 镜像(含 ttyS0 autologin,供 VMGroup 起 VM)。
 
     packages:apk 包名列表(如 ["frr","dnsmasq",...])。
@@ -389,6 +592,94 @@ def build_base(*, out_raw: str, packages, bake_files=None, iso: str = DEFAULT_IS
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def build_fedora_cloud(*, out_qcow2: str, release: int, arch: str = "x86_64",
+                       host_port: int = 2222, ssh_user: str = "zfsbuild",
+                       ssh_keyfile: str | None = None, provision_script: str | None = None,
+                       mem: int = 4096, smp: int = 4):
+    """下载 Fedora Cloud Base qcow2 + cloud-init 注入 ssh key + 跑 provision 后关机。
+
+    参考实现(演示 build_base 可插拔,注册名 "fedora-cloud"):适合用 cloud-init 的发行版,
+    产出可复用 qcow2(类似 zfs-compat 的 prep,但走 vmkit 的 QemuVM/SshConsole)。
+    需要 host 的 mkisofs/genisoimage。
+    """
+    import urllib.request
+    image_dir = (f"https://download.fedoraproject.org/pub/fedora/linux/releases/"
+                 f"{release}/Cloud/{arch}/images/")
+    d = os.path.dirname(out_qcow2)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="vmkit-fedora-")
+    try:
+        # 1) 目录里找最新 Generic qcow2
+        listing = urllib.request.urlopen(image_dir, timeout=60).read().decode()
+        names = sorted(set(re.findall(r'Fedora-Cloud-Base-Generic-[^"]*\.qcow2', listing)))
+        if not names:
+            raise ValueError(f"目录里找不到 Generic qcow2: {image_dir}")
+        name = names[-1]
+        print(f">> 下载 {image_dir}{name} ...", flush=True)
+        img = os.path.join(tmp, name)
+        urllib.request.urlretrieve(image_dir + name, img)
+
+        # 2) ssh 密钥(缺省自动生成)
+        key = ssh_keyfile
+        if key is None:
+            key = os.path.join(tmp, "id")
+            subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key, "-q"], check=True)
+        with open(key + ".pub") as f:
+            pub = f.read().strip()
+
+        # 3) cloud-init NoCloud seed
+        seed = os.path.join(tmp, "seed")
+        os.makedirs(seed)
+        with open(os.path.join(seed, "user-data"), "w") as f:
+            f.write("#cloud-config\n"
+                    f"users:\n  - name: {ssh_user}\n    groups: wheel\n"
+                    f"    sudo: \"ALL=(ALL) NOPASSWD: ALL\"\n"
+                    f"    ssh_authorized_keys:\n      - {pub}\n"
+                    "ssh_pwauth: false\ndisable_root: true\n")
+        with open(os.path.join(seed, "meta-data"), "w") as f:
+            f.write("instance-id: vmkit-fedora\nlocal-hostname: vmkit-fedora\n")
+        mkiso = next((x for x in ("mkisofs", "genisoimage")
+                      if shutil.which(x)), None)
+        if not mkiso:
+            raise RuntimeError("需要 host 装 mkisofs 或 genisoimage 生成 cloud-init seed ISO")
+        iso = os.path.join(tmp, "seed.iso")
+        if subprocess.run([mkiso, "-quiet", "-o", iso, "-V", "cidata", "-R", "-J", seed]).returncode:
+            raise RuntimeError(f"{mkiso} 生成 seed ISO 失败")
+
+        # 4) 起 VM(hostfwd 进 SSH),跑 provision,关机
+        shutil.copy(img, out_qcow2)
+        vm = QemuVM("vmkit-fedora-build",
+                    disks=[{"path": out_qcow2, "format": "qcow2"}],
+                    cdrom=iso,
+                    nics=[{"netdev": "user,id=n0",
+                           "hostfwd": f"hostfwd=tcp:127.0.0.1:{host_port}-:22"}],
+                    mem=mem, smp=smp, machine="q35",
+                    log_path=out_qcow2 + ".qemu.log")
+        vm.start()
+        try:
+            con = SshConsole("127.0.0.1", port=host_port, user=ssh_user,
+                             keyfile=key, timeout=30, strict_host_checking=False)
+            print("== 等 SSH(cloud-init 首次启动,最多 10 分钟)...", flush=True)
+            con.connect(timeout=600)
+            print("== SSH ok", flush=True)
+            if provision_script:
+                con.scp_send(provision_script, "/tmp/provision.sh")
+                out, _ = con.run("sudo bash /tmp/provision.sh", timeout=1800, check=True)
+                print(out)
+            con.run("sudo poweroff", timeout=10)
+        finally:
+            vm.kill()
+        print(f">> built {out_qcow2}", flush=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# 注册内建构建器
+register_builder("alpine", build_alpine)
+register_builder("fedora-cloud", build_fedora_cloud)
+
+
 # ===================== VM 组生命周期 =====================
 class VMGroup:
     """从 base 镜像稀疏克隆起一组 VM,挂虚拟总线,串口编排。"""
@@ -453,19 +744,126 @@ class VMGroup:
 
 
 # ===================== CLI =====================
-def _cli():
-    """python3 vmkit.py exec <sock> '<cmd>'  -- 对运行中 VM 跑一条命令。"""
-    if len(sys.argv) >= 4 and sys.argv[1] == "exec":
-        sock, cmd = sys.argv[2], sys.argv[3]
+def _cli() -> int:
+    import argparse, json
+    argv = sys.argv[1:]
+
+    # 向后兼容快路径:python3 vmkit.py exec <sock> '<cmd>' (串口)
+    if len(argv) >= 2 and argv[0] == "exec" and not argv[1].startswith("--"):
+        if len(argv) < 3:
+            print("用法: vmkit.py exec <sock> '<cmd>'", file=sys.stderr)
+            return 2
+        sock, cmd = argv[1], argv[2]
         con = Console(sock, log_path=None); con.connect(10)
         login_alpine(con, 60)
         out, rc = run_cmd(con, cmd, timeout=30)
         print(out); print(f"[rc={rc}]")
         con.close()
-        return
-    print(__doc__)
-    print("\nCLI: python3 vmkit.py exec <sock> '<cmd>'")
+        return 0
+
+    ap = argparse.ArgumentParser(prog="vmkit")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    # qemu start/stop/status(zfs-compat 调用面)
+    p = sub.add_parser("qemu", help="QEMU VM 生命周期(qcow2/hostfwd/q35 等 via spec json)")
+    qsub = p.add_subparsers(dest="qcmd", required=True)
+    qs = qsub.add_parser("start"); qs.add_argument("name"); qs.add_argument("spec")
+    qstop = qsub.add_parser("stop"); qstop.add_argument("name"); qstop.add_argument("--pidfile")
+    qstat = qsub.add_parser("status"); qstat.add_argument("name"); qstat.add_argument("--pidfile")
+
+    # VMGroup
+    lp = sub.add_parser("launch", help="从 group.json 起一组 VM")
+    lp.add_argument("group")
+    sp = sub.add_parser("stop", help="停掉 group.json 对应的一组 VM")
+    sp.add_argument("group")
+
+    # build
+    bp = sub.add_parser("build", help="build_base(distro=...) 分发;spec 为构建器参数 JSON")
+    bp.add_argument("distro"); bp.add_argument("spec")
+
+    # status:扫描目录下的 *.pid
+    st = sub.add_parser("status", help="扫描 pidfile 目录列出运行中 VM")
+    st.add_argument("--dir", default=".")
+
+    # exec --ssh <host> <cmd>
+    es = sub.add_parser("exec", help="exec --ssh [--port] [--user] [--key] [--insecure] <host> '<cmd>'")
+    es.add_argument("--ssh", action="store_true")
+    es.add_argument("--port", type=int, default=22)
+    es.add_argument("--user", default="root")
+    es.add_argument("--key")
+    es.add_argument("--insecure", action="store_true",
+                    help="关闭 host key 校验(仅限可信/一次性环境)")
+    es.add_argument("host"); es.add_argument("cmd")
+
+    ns = ap.parse_args(argv)
+
+    if ns.cmd == "qemu":
+        if ns.qcmd == "start":
+            with open(ns.spec) as f:
+                spec = json.load(f)
+            vm = QemuVM.from_spec(ns.name, spec)
+            vm.start()
+            print(vm.pidfile or (vm.proc.pid if vm.proc else "started"))
+            return 0
+        name = ns.name
+        pidfile = ns.pidfile or f"{name}.pid"
+        vm = QemuVM(name, daemonize=True, pidfile=pidfile)
+        if ns.qcmd == "stop":
+            vm.kill()
+            return 0
+        # status
+        if vm.is_alive():
+            print("running")
+            return 0
+        print("stopped")
+        return 1
+
+    if ns.cmd == "launch":
+        with open(ns.group) as f:
+            g = json.load(f)
+        grp = VMGroup(g["base_raw"], g["disks_dir"], g["logs_dir"])
+        grp.launch(g.get("vms", {}))
+        return 0
+
+    if ns.cmd == "stop":
+        with open(ns.group) as f:
+            g = json.load(f)
+        grp = VMGroup(g["base_raw"], g["disks_dir"], g["logs_dir"])
+        grp.stop()
+        return 0
+
+    if ns.cmd == "build":
+        with open(ns.spec) as f:
+            spec = json.load(f)
+        build_base(distro=ns.distro, **spec)
+        return 0
+
+    if ns.cmd == "status":
+        alive = []
+        for name in sorted(os.listdir(ns.dir)):
+            if not name.endswith(".pid"):
+                continue
+            path = os.path.join(ns.dir, name)
+            try:
+                pid = int(open(path).read().strip())
+                os.kill(pid, 0)
+                alive.append((name, pid))
+            except (OSError, ValueError):
+                pass
+        for name, pid in alive:
+            print(f"{name} {pid}")
+        return 0
+
+    if ns.cmd == "exec" and ns.ssh:
+        s = SshConsole(ns.host, port=ns.port, user=ns.user, keyfile=ns.key,
+                       strict_host_checking=not ns.insecure)
+        out, rc = s.run(ns.cmd)
+        print(out); print(f"[rc={rc}]")
+        return 0
+
+    ap.print_help()
+    return 2
 
 
 if __name__ == "__main__":
-    _cli()
+    sys.exit(_cli())

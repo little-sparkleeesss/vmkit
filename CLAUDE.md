@@ -5,8 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目定位
 
 vmkit 是**单文件、零依赖**的 Python 库(`vmkit.py`),在 Linux host 上用 **rootless KVM + QEMU** 构建 base
-镜像、起若干无头 Alpine VM,经**串口(unix socket)**做编排(登录、跑命令、做断言)。定位是"需要真实内核/网络栈、
-又不想动 host"的测试场景--零 host 网络影响(无 bridge/tap、无 root)。详细用法见 `README.md`。
+镜像、起若干无头 VM,经**串口(unix socket)**(Alpine 等)或 **SSH(hostfwd)**(Fedora 等)做编排。定位是
+"需要真实内核/网络栈、又不想动 host"的测试场景--零 host 网络影响(无 bridge/tap、无 root)。详细用法见 `README.md`。
+
+自 v2 起已泛化:QemuVM 支持 qcow2/backing 覆盖盘、`machine`(q35)、`nics[].hostfwd`、`daemonize/pidfile`、
+`serial` 可配;新增 `SshConsole`;`build_base` 可插拔(`register_builder(distro, fn)`,内置 `alpine` 与
+`fedora-cloud`);CLI 扩到 `qemu/launch/stop/build/status/exec`。
+
+**硬性向后兼容约束**:所有新增参数必须带默认值,缺省行为 == v1(如 `QemuVM` 缺省 raw 盘 + unix 串口 + 前台
+Popen;`build_base` 缺省 distro="alpine";CLI `exec <sock> '<cmd>'` 走原快路径)。改代码前先想旧脚本会不会坏。
 
 ## 常用命令
 
