@@ -54,6 +54,9 @@ s2 = vmkit.SshConsole("h", strict_host_checking=False)
 check("非严格=no+/dev/null",
       any(o == "StrictHostKeyChecking=no" for o in s2.opts)
       and any(o == "UserKnownHostsFile=/dev/null" for o in s2.opts))
+ssh_args = s2._ssh("uname -r")
+check("ssh 参数顺序: destination 在 command 前",
+      ssh_args[-2] == "root@h" and ssh_args[-1] == "uname -r")
 
 print("== build_base 可插拔 ==")
 check("注册 alpine", "alpine" in vmkit.BUILDERS)
@@ -81,5 +84,18 @@ r = cli("status", "--dir", "/tmp")
 check("status --dir exit 0", r.returncode == 0)
 r = cli("exec", "--ssh", "--help")
 check("exec --ssh 帮助 exit 0", r.returncode == 0)
+
+print("== 生命周期清理 ==")
+import tempfile  # noqa: E402
+with tempfile.NamedTemporaryFile("w", delete=False) as f:
+    f.write("not-a-pid\n")
+    pf = f.name
+try:
+    vm = vmkit.QemuVM("kill-test", daemonize=True, pidfile=pf)
+    vm.kill()
+    check("kill 后清理 pidfile", not os.path.exists(pf))
+finally:
+    if os.path.exists(pf):
+        os.unlink(pf)
 
 print("\n全部通过")

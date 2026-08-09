@@ -331,6 +331,10 @@ class QemuVM:
         if self.serial_sock:
             try: os.unlink(self.serial_sock)
             except FileNotFoundError: pass
+        # 停止后清掉 pidfile，避免后续 status 读到陈旧 PID（被复用时会误报 running）
+        if self.pidfile:
+            try: os.unlink(self.pidfile)
+            except FileNotFoundError: pass
 
 
 def _netdev_id(netdev_spec: str) -> str:
@@ -420,7 +424,9 @@ class SshConsole:
         self.dest = f"{user}@{host}"
 
     def _ssh(self, cmd: str) -> list[str]:
-        return ["ssh"] + self.opts + ["-p", str(self.port), cmd, self.dest]
+        # OpenSSH 语法: ssh [options] destination [command]
+        # 命令必须放在 destination 之后，否则第一个位置参数会被当成主机名
+        return ["ssh"] + self.opts + ["-p", str(self.port), self.dest, cmd]
 
     def connect(self, timeout: float | None = None):
         """等 SSH 可连(带退避);超时抛 Timeout。"""
