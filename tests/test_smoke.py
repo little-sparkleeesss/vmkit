@@ -18,7 +18,8 @@ def check(name, cond):
 
 print("== 向后兼容 API 面 ==")
 for n in ("Console", "QemuVM", "VMGroup", "SshConsole",
-          "login_alpine", "run_cmd", "build_base", "register_builder"):
+          "login_alpine", "run_cmd", "build_base", "register_builder",
+          "create_overlay", "port_free", "provision_cloud_vm"):
     check(f"has {n}", hasattr(vmkit, n))
 
 import inspect  # noqa: E402
@@ -97,5 +98,37 @@ try:
 finally:
     if os.path.exists(pf):
         os.unlink(pf)
+
+print("== 通用生命周期辅助 ==")
+import socket as _socket  # noqa: E402
+try:
+    s = _socket.socket()
+    s.bind(("127.0.0.1", 0))
+    _port = s.getsockname()[1]
+    check("端口占用检测", vmkit.port_free("127.0.0.1", _port) is False)
+    s.close()
+    check("端口释放检测", vmkit.port_free("127.0.0.1", _port) is True)
+except OSError as _e:
+    print(f"  skip 端口测试（当前环境不允许 bind: {_e}）")
+
+with tempfile.TemporaryDirectory() as td:
+    _base = os.path.join(td, "base.qcow2")
+    subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", _base, "1M"], check=True)
+    _ovl = vmkit.create_overlay(_base, os.path.join(td, "ovl.qcow2"))
+    check("create_overlay 生成覆盖盘", os.path.exists(_ovl))
+
+with tempfile.NamedTemporaryFile("w", delete=False) as f:
+    f.write("not-a-pid\n")
+    _pf = f.name
+try:
+    with vmkit.QemuVM("ctx-test", daemonize=True, pidfile=_pf):
+        pass
+    check("上下文管理器退出后 pidfile 已清理", not os.path.exists(_pf))
+finally:
+    if os.path.exists(_pf):
+        os.unlink(_pf)
+
+_vm = vmkit.QemuVM("wait-test", daemonize=True, pidfile="/tmp/vmkit-nonexistent.pid")
+check("wait_exit 对不存在 VM 返回 True", _vm.wait_exit(timeout=1))
 
 print("\n全部通过")

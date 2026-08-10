@@ -12,7 +12,8 @@
 用法见同目录 README.md。
 """
 from __future__ import annotations
-import os, re, select, socket, subprocess, time, signal, shutil, shlex, tempfile, urllib.parse, sys
+import os, re, select, socket, subprocess, time, signal, shutil, shlex, tempfile, urllib.parse, sys, hashlib
+from datetime import datetime, timezone
 
 # ---- .env 加载(机器/敏感配置;不覆盖已 export 的环境变量)----
 def _load_env(start: str | None = None) -> None:
@@ -150,6 +151,32 @@ class Console:
 
 
 # ===================== QEMU 启停 =====================
+def create_overlay(base: str, overlay: str, backing_format: str = "qcow2",
+                   size: str | None = None) -> str:
+    """基于 base 创建 qcow2 写时复制覆盖盘（供一次性 VM 使用）。"""
+    cmd = ["qemu-img", "create", "-q", "-f", "qcow2", "-b", base,
+           "-F", backing_format, overlay]
+    if size:
+        cmd.append(size)
+    subprocess.run(cmd, check=True)
+    return overlay
+
+
+def port_free(host: str, port: int) -> bool:
+    """端口是否可绑定（未被其他 VM hostfwd/进程占用）。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+        return True
+    except OSError:
+        return False
+
+
+def assert_port_free(host: str, port: int) -> None:
+    if not port_free(host, port):
+        raise RuntimeError(f"端口 {host}:{port} 已被占用，可能有 VM 在跑")
+
+
 class QemuVM:
     """启动/停止一个 QEMU VM(KVM;盘格式可配;串口走 unix socket 或 file)。
 
@@ -336,6 +363,22 @@ class QemuVM:
             try: os.unlink(self.pidfile)
             except FileNotFoundError: pass
 
+    def wait_exit(self, timeout: float = 300.0) -> bool:
+        """等 VM 退出（最多 timeout 秒）；已退出返回 True。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.is_alive():
+                return True
+            time.sleep(2)
+        return False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.kill()
+        return False
+
 
 def _netdev_id(netdev_spec: str) -> str:
     for part in netdev_spec.split(","):
@@ -441,6 +484,29 @@ class SshConsole:
             if time.monotonic() > deadline:
                 raise Timeout(f"ssh connect timeout to {self.dest}:{self.port}")
             time.sleep(1)
+
+    def reboot_and_wait(self, *, verify: str | None = None,
+                        drop_timeout: float = 120.0,
+                        reconnect_timeout: float = 600.0,
+                        verify_timeout: float = 30.0) -> None:
+        """触发远端重启：等 SSH 掉线 → 等回连 → 可选执行校验命令。"""
+        try:
+            self.run("sudo reboot", timeout=10)
+        except Timeout:
+            pass
+        deadline = time.monotonic() + drop_timeout
+        while time.monotonic() < deadline:
+            try:
+                if self.run("true", timeout=3)[1] != 0:
+                    break
+            except Timeout:
+                break
+            time.sleep(2)
+        self.connect(timeout=reconnect_timeout)
+        if verify is not None:
+            out, rc = self.run(verify, timeout=verify_timeout)
+            if rc != 0:
+                raise RuntimeError(f"reboot verify failed rc={rc}: {verify!r}\n{out}")
 
     def run(self, cmd: str, timeout: float | None = None,
             check: bool = False) -> tuple[str, int]:
@@ -601,11 +667,16 @@ def build_alpine(*, out_raw: str, packages, bake_files=None, iso: str = DEFAULT_
 def build_fedora_cloud(*, out_qcow2: str, release: int, arch: str = "x86_64",
                        host_port: int = 2222, ssh_user: str = "zfsbuild",
                        ssh_keyfile: str | None = None, provision_script: str | None = None,
-                       mem: int = 4096, smp: int = 4):
+                       mem: int = 4096, smp: int = 4,
+                       extra_disks: list | None = None,
+                       seed_iso: str | None = None,
+                       checksum_verify: bool = True,
+                       resize_gb: int | None = None,
+                       skip_download: bool = False):
     """下载 Fedora Cloud Base qcow2 + cloud-init 注入 ssh key + 跑 provision 后关机。
 
     参考实现(演示 build_base 可插拔,注册名 "fedora-cloud"):适合用 cloud-init 的发行版,
-    产出可复用 qcow2(类似 zfs-compat 的 prep,但走 vmkit 的 QemuVM/SshConsole)。
+    产出可复用 qcow2。通用起 VM/SSH/provision 部分复用 provision_cloud_vm。
     需要 host 的 mkisofs/genisoimage。
     """
     import urllib.request
@@ -622,9 +693,36 @@ def build_fedora_cloud(*, out_qcow2: str, release: int, arch: str = "x86_64",
         if not names:
             raise ValueError(f"目录里找不到 Generic qcow2: {image_dir}")
         name = names[-1]
-        print(f">> 下载 {image_dir}{name} ...", flush=True)
-        img = os.path.join(tmp, name)
-        urllib.request.urlretrieve(image_dir + name, img)
+        if skip_download and os.path.exists(out_qcow2):
+            print(f">> 使用已有镜像 {out_qcow2}（skip_download）", flush=True)
+        else:
+            print(f">> 下载 {image_dir}{name} ...", flush=True)
+            img = os.path.join(tmp, name)
+            urllib.request.urlretrieve(image_dir + name, img)
+            if checksum_verify:
+                cs_names = sorted(set(re.findall(
+                    r'Fedora-Cloud-[^"\s]*(?:CHECKSUM|CHKSUM)', listing)))
+                if cs_names:
+                    cs_text = urllib.request.urlopen(
+                        image_dir + cs_names[-1], timeout=60).read().decode()
+                    expected = ""
+                    for line in cs_text.splitlines():
+                        if line.startswith("SHA256 (") and name in line:
+                            expected = line.rsplit("=", 1)[-1].strip()
+                            break
+                    if expected:
+                        h = hashlib.sha256()
+                        with open(img, "rb") as f:
+                            for chunk in iter(lambda: f.read(1 << 20), b""):
+                                h.update(chunk)
+                        if h.hexdigest() != expected:
+                            raise RuntimeError(f"镜像 sha256 校验失败: {name}")
+                        print(">> sha256 校验通过", flush=True)
+                    else:
+                        print(f">> 警告: CHECKSUM 里找不到 {name}，跳过校验", flush=True)
+            if resize_gb:
+                subprocess.run(["qemu-img", "resize", img, f"{resize_gb}G"], check=True)
+            shutil.move(img, out_qcow2)
 
         # 2) ssh 密钥(缺省自动生成)
         key = ssh_keyfile
@@ -634,48 +732,37 @@ def build_fedora_cloud(*, out_qcow2: str, release: int, arch: str = "x86_64",
         with open(key + ".pub") as f:
             pub = f.read().strip()
 
-        # 3) cloud-init NoCloud seed
-        seed = os.path.join(tmp, "seed")
-        os.makedirs(seed)
-        with open(os.path.join(seed, "user-data"), "w") as f:
-            f.write("#cloud-config\n"
-                    f"users:\n  - name: {ssh_user}\n    groups: wheel\n"
-                    f"    sudo: \"ALL=(ALL) NOPASSWD: ALL\"\n"
-                    f"    ssh_authorized_keys:\n      - {pub}\n"
-                    "ssh_pwauth: false\ndisable_root: true\n")
-        with open(os.path.join(seed, "meta-data"), "w") as f:
-            f.write("instance-id: vmkit-fedora\nlocal-hostname: vmkit-fedora\n")
-        mkiso = next((x for x in ("mkisofs", "genisoimage")
-                      if shutil.which(x)), None)
-        if not mkiso:
-            raise RuntimeError("需要 host 装 mkisofs 或 genisoimage 生成 cloud-init seed ISO")
-        iso = os.path.join(tmp, "seed.iso")
-        if subprocess.run([mkiso, "-quiet", "-o", iso, "-V", "cidata", "-R", "-J", seed]).returncode:
-            raise RuntimeError(f"{mkiso} 生成 seed ISO 失败")
+        # 3) cloud-init NoCloud seed（可传入现成 seed ISO）
+        iso = seed_iso
+        if iso is None:
+            seed = os.path.join(tmp, "seed")
+            os.makedirs(seed)
+            with open(os.path.join(seed, "user-data"), "w") as f:
+                f.write("#cloud-config\n"
+                        f"users:\n  - name: {ssh_user}\n    groups: wheel\n"
+                        f"    sudo: \"ALL=(ALL) NOPASSWD: ALL\"\n"
+                        f"    ssh_authorized_keys:\n      - {pub}\n"
+                        "ssh_pwauth: false\ndisable_root: true\n")
+            with open(os.path.join(seed, "meta-data"), "w") as f:
+                f.write("instance-id: vmkit-fedora\nlocal-hostname: vmkit-fedora\n")
+            mkiso = next((x for x in ("mkisofs", "genisoimage")
+                          if shutil.which(x)), None)
+            if not mkiso:
+                raise RuntimeError("需要 host 装 mkisofs 或 genisoimage 生成 cloud-init seed ISO")
+            iso = os.path.join(tmp, "seed.iso")
+            if subprocess.run([mkiso, "-quiet", "-o", iso, "-V", "cidata", "-R", "-J", seed]).returncode:
+                raise RuntimeError(f"{mkiso} 生成 seed ISO 失败")
 
         # 4) 起 VM(hostfwd 进 SSH),跑 provision,关机
-        shutil.copy(img, out_qcow2)
-        vm = QemuVM("vmkit-fedora-build",
-                    disks=[{"path": out_qcow2, "format": "qcow2"}],
-                    cdrom=iso,
-                    nics=[{"netdev": "user,id=n0",
-                           "hostfwd": f"hostfwd=tcp:127.0.0.1:{host_port}-:22"}],
-                    mem=mem, smp=smp, machine="q35",
-                    log_path=out_qcow2 + ".qemu.log")
-        vm.start()
-        try:
-            con = SshConsole("127.0.0.1", port=host_port, user=ssh_user,
-                             keyfile=key, timeout=30, strict_host_checking=False)
-            print("== 等 SSH(cloud-init 首次启动,最多 10 分钟)...", flush=True)
-            con.connect(timeout=600)
-            print("== SSH ok", flush=True)
-            if provision_script:
-                con.scp_send(provision_script, "/tmp/provision.sh")
-                out, _ = con.run("sudo bash /tmp/provision.sh", timeout=1800, check=True)
-                print(out)
-            con.run("sudo poweroff", timeout=10)
-        finally:
-            vm.kill()
+        out, rc = provision_cloud_vm(
+            out_qcow2=out_qcow2, host_port=host_port, ssh_user=ssh_user,
+            ssh_keyfile=key, provision_script=provision_script, seed_iso=iso,
+            extra_disks=extra_disks, mem=mem, smp=smp, boot="c",
+            poweroff_after=True)
+        if out:
+            print(out)
+        if rc != 0:
+            raise RuntimeError(f"provision 失败 rc={rc}")
         print(f">> built {out_qcow2}", flush=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -683,6 +770,73 @@ def build_fedora_cloud(*, out_qcow2: str, release: int, arch: str = "x86_64",
 
 # 注册内建构建器
 register_builder("alpine", build_alpine)
+
+
+def provision_cloud_vm(*, out_qcow2: str, host_port: int, ssh_user: str,
+                       ssh_keyfile: str | None = None,
+                       provision_script: str | None = None,
+                       seed_iso: str | None = None,
+                       extra_disks: list | None = None,
+                       mem: int = 4096, smp: int = 4,
+                       boot: str | None = None,
+                       provision_timeout: float = 1800.0,
+                       ssh_timeout: float = 600.0,
+                       poweroff_after: bool = True,
+                       serial: str | None = None,
+                       log_path: str | None = None,
+                       strict_host_checking: bool = False) -> tuple[str, int]:
+    """起一台 cloud 镜像 VM（可带 NoCloud seed ISO / 附加盘），SSH 跑可选 provision 脚本。
+
+    返回 (脚本输出, 退出码)。脚本自身关机（poweroff_after=False）时 SSH 断开属正常
+    （rc=255）；poweroff_after=True 时跑完由本函数执行 sudo poweroff。VM 退出或
+    超时后统一清理（QemuVM.kill）。
+    """
+    assert_port_free("127.0.0.1", host_port)
+    disks = [{"path": out_qcow2, "format": "qcow2"}]
+    for d in (extra_disks or []):
+        if isinstance(d, dict):
+            disks.append(d)
+        else:
+            disks.append({"path": d, "format": "qcow2"})
+    vm = QemuVM("vmkit-provision",
+                disks=disks,
+                cdrom=seed_iso,
+                nics=[{"netdev": "user,id=n0",
+                       "hostfwd": f"hostfwd=tcp:127.0.0.1:{host_port}-:22"}],
+                mem=mem, smp=smp, machine="q35",
+                # NoCloud seed 只是数据源，必须从磁盘引导；无 cdrom 时保持缺省
+                boot=boot or ("c" if seed_iso else None),
+                serial=serial or "none",
+                log_path=log_path or (out_qcow2 + ".qemu.log"))
+    vm.start()
+    try:
+        con = SshConsole("127.0.0.1", port=host_port, user=ssh_user,
+                         keyfile=ssh_keyfile, timeout=30,
+                         strict_host_checking=strict_host_checking)
+        con.connect(timeout=ssh_timeout)
+        out, rc = "", 0
+        if provision_script:
+            con.scp_send(provision_script, "/tmp/provision.sh")
+            try:
+                out, rc = con.run("sudo bash /tmp/provision.sh",
+                                  timeout=provision_timeout, check=False)
+            except Timeout:
+                raise Timeout(f"provision script timeout: {provision_script!r}")
+        if poweroff_after:
+            try:
+                con.run("sudo poweroff", timeout=10)
+            except Timeout:
+                pass
+        return out, rc
+    finally:
+        # 给 guest 一点时间干净退出（脚本 poweroff 时）；超时再强杀
+        try:
+            if not vm.wait_exit(timeout=30):
+                vm.kill()
+        except Exception:
+            vm.kill()
+
+
 register_builder("fedora-cloud", build_fedora_cloud)
 
 
@@ -750,6 +904,155 @@ class VMGroup:
 
 
 # ===================== CLI =====================
+# ===================== 日志过滤 =====================
+VALID_LOG_LEVELS = ("brief", "normal", "verbose")
+_ANSI = re.compile(rb"\x1b\[[0-9;]*m")
+_INVM_PREFIX = b"[in-vm "
+
+_C_CYAN = b"\033[36m"
+_C_RESET = b"\033[0m"
+_C_GREEN = b"\033[32m"
+_C_YELLOW = b"\033[33m"
+_C_RED = b"\033[31m"
+
+_RESULT_COLORS = (
+    (b"[PASS]", _C_GREEN),
+    (b"[FAIL]", _C_RED),
+    (b"[KILLED]", _C_RED),
+    (b"[SKIP]", _C_YELLOW),
+)
+
+
+def _logfilter_utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _logfilter_prefix(use_color: bool) -> bytes:
+    ts = _logfilter_utc_now().encode()
+    if use_color:
+        return b"[" + _C_CYAN + b"in-vm" + _C_RESET + b" " + ts + b"] "
+    return b"[in-vm " + ts + b"] "
+
+
+def render_log_line(level: str, line: bytes, use_color: bool) -> bytes | None:
+    """按等级过滤单行日志（不含换行）；None 表示丢弃。"""
+    plain = _ANSI.sub(b"", line)
+    if level == "brief":
+        return None
+    if level == "normal" and not plain.startswith(_INVM_PREFIX):
+        return None
+    if plain.startswith(_INVM_PREFIX) or not line.strip():
+        return line
+    return _logfilter_prefix(use_color) + line
+
+
+def colorize_results(line: bytes, use_color: bool) -> bytes:
+    """给测试结果标记 [PASS]/[FAIL]/[SKIP]/[KILLED] 上色（仅终端显示）。"""
+    if not use_color:
+        return line
+    for token, color in _RESULT_COLORS:
+        line = line.replace(token, color + token + _C_RESET)
+    return line
+
+
+def logfilter(level: str = "normal", src=None, out=None) -> int:
+    """终端日志分级过滤器：从 src（二进制）读入，按等级过滤后写到 out（二进制）。
+
+    等级语义：
+      verbose  全部转发；非 [in-vm ...] 标记行自动补 [in-vm <UTC时间戳>] 前缀
+      normal   只转发 [in-vm ...] 阶段标记
+      brief    全部丢弃
+    \\r 进度条（curl 等）用 \\r 重绘同一行，这里按二进制合并：TTY 下原地刷新，
+    非 TTY 只输出最后一次重绘并正常加前缀。恒退出 0，避免管道半开撞 SIGPIPE。
+    """
+    if level not in VALID_LOG_LEVELS:
+        sys.stderr.write(f"logfilter: 未知等级: {level}（可选 {', '.join(VALID_LOG_LEVELS)}）\n")
+        level = "normal"
+    src = src or sys.stdin.buffer
+    out = out or sys.stdout.buffer
+    use_color = bool(getattr(out, "isatty", lambda: False)())
+
+    def emit_normal(line: bytes) -> None:
+        rendered = render_log_line(level, line, use_color)
+        if rendered is not None:
+            rendered = colorize_results(rendered, use_color)
+            out.write(rendered)
+            out.write(b"\n")
+            out.flush()
+
+    def emit_progress(content: bytes) -> None:
+        if level != "verbose":
+            return
+        if use_color:
+            out.write(b"\r")
+            out.write(content)
+            out.write(b"\n")
+        else:
+            rendered = render_log_line(level, content, use_color)
+            if rendered is not None:
+                rendered = colorize_results(rendered, use_color)
+                out.write(rendered)
+                out.write(b"\n")
+        out.flush()
+
+    try:
+        line = bytearray()
+        progress: bytes | None = None
+        saw_cr = False
+        buf = b""
+
+        def flush_line() -> None:
+            nonlocal line, progress, saw_cr
+            final = bytes(line) if line else None
+            line.clear()
+            if saw_cr:
+                if final is not None:
+                    progress = final
+                emit_progress(progress if progress is not None else b"")
+            else:
+                emit_normal(final if final is not None else b"")
+            progress = None
+            saw_cr = False
+
+        for chunk in src:
+            buf += chunk
+            pos = 0
+            while True:
+                cr = buf.find(b"\r", pos)
+                nl = buf.find(b"\n", pos)
+                if cr == -1 and nl == -1:
+                    break
+                if cr != -1 and (nl == -1 or cr < nl):
+                    line.extend(buf[pos:cr])
+                    pos = cr + 1
+                    if line:
+                        progress = bytes(line)
+                        line.clear()
+                        saw_cr = True
+                        if use_color and level == "verbose":
+                            out.write(b"\r")
+                            out.write(progress)
+                            out.flush()
+                else:
+                    line.extend(buf[pos:nl])
+                    pos = nl + 1
+                    flush_line()
+            buf = buf[pos:]
+        if line or saw_cr:
+            flush_line()
+    except BrokenPipeError:
+        try:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull_fd, out.fileno())
+            os.close(devnull_fd)
+        except (OSError, AttributeError):
+            pass
+        for _ in src:
+            pass
+    return 0
+
+
+# ===================== CLI =====================
 def _cli() -> int:
     import argparse, json
     argv = sys.argv[1:]
@@ -786,6 +1089,16 @@ def _cli() -> int:
     # build
     bp = sub.add_parser("build", help="build_base(distro=...) 分发;spec 为构建器参数 JSON")
     bp.add_argument("distro"); bp.add_argument("spec")
+
+    # provision-cloud:起 cloud 镜像 VM 跑 provisioning
+    pc = sub.add_parser("provision-cloud",
+                        help="起 cloud 镜像 VM 并跑 provisioning(spec 为 provision_cloud_vm 参数 JSON)")
+    pc.add_argument("spec")
+
+    # logfilter:按等级过滤 stdin 日志
+    lfp = sub.add_parser("logfilter",
+                         help="按 brief/normal/verbose 过滤 stdin 日志到 stdout")
+    lfp.add_argument("level", nargs="?", default="normal")
 
     # status:扫描目录下的 *.pid
     st = sub.add_parser("status", help="扫描 pidfile 目录列出运行中 VM")
@@ -843,6 +1156,21 @@ def _cli() -> int:
             spec = json.load(f)
         build_base(distro=ns.distro, **spec)
         return 0
+
+    if ns.cmd == "provision-cloud":
+        with open(ns.spec) as f:
+            spec = json.load(f)
+        try:
+            out, rc = provision_cloud_vm(**spec)
+        except Timeout as e:
+            print(f"provision-cloud: timeout: {e}", file=sys.stderr)
+            return 124
+        if out:
+            print(out)
+        return rc
+
+    if ns.cmd == "logfilter":
+        return logfilter(ns.level, sys.stdin.buffer, sys.stdout.buffer)
 
     if ns.cmd == "status":
         alive = []

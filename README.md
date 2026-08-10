@@ -35,6 +35,10 @@ vmkit 是单文件库,三种方式任选:
   - 网络:`nics[].hostfwd` 追加进 user netdev(**hostfwd 进 SSH**);仍支持 `socket,mcast` 虚拟总线。
   - 生命周期:`daemonize=True, pidfile=...`(经 `-daemonize -pidfile`,kill/status 读 pidfile)。
   - `QemuVM.from_spec(name, dict)` 从 dict 构造。
+- **通用辅助**:`create_overlay()`(qcow2 写时复制覆盖盘)、`port_free()`(hostfwd 端口预检)、
+  `QemuVM` 上下文管理器与 `wait_exit()`、`SshConsole.reboot_and_wait()`(重启→等掉线→回连→校验)、
+  `provision_cloud_vm()`(起 cloud 镜像 VM + SSH provision + 关机清理)。
+- **日志过滤**:内置 `logfilter()` 函数与 `vmkit.py logfilter` 子命令,合并 `\r` 进度条重绘、按等级过滤、给结果标记着色。
 - **起 N 个 VM**(`VMGroup`):从 base 稀疏克隆,挂虚拟 L2 总线/显式 MAC。仍可用。
 - **编排**(两种并存):
   - 串口 `Console`/`login_alpine`/`run_cmd`:unix-socket,expect/send,marker 取 rc,去回显。OS 无关。
@@ -66,10 +70,20 @@ vm = vmkit.QemuVM("v", disks=[{"path":"/tmp/ovl.qcow2","format":"qcow2"}],
                   machine="q35", daemonize=True, pidfile="/tmp/v.pid",
                   serial="file:/tmp/v.serial")
 vm.start(); vm.is_alive(); vm.kill()
+# 上下文管理器:退出自动 kill
+with vmkit.QemuVM("v2", disks=[...]) as vm2:
+    vm2.start(); ...
+# 通用辅助
+vmkit.create_overlay("disks/base.qcow2", "disks/ovl.qcow2")
+vmkit.port_free("127.0.0.1", 2222)          # True=可绑定
+out, rc = vmkit.provision_cloud_vm(out_qcow2="disks/base.qcow2", host_port=2222,
+                                   ssh_user="zfsbuild", seed_iso="seed.iso",
+                                   provision_script="provision.sh")
 # SSH 编排(hostfwd 进 guest sshd;strict_host_checking 默认 True)
 s = vmkit.SshConsole("127.0.0.1", port=2222, user="zfsbuild",
                      keyfile="/k", strict_host_checking=False)
 s.connect(); out, rc = s.run("uname -r"); s.scp_send("/a", "/tmp/a")
+s.reboot_and_wait(verify="uname -r")
 ```
 
 ## CLI
@@ -82,6 +96,8 @@ python3 vmkit.py qemu status <name> [--pidfile]  # exit 0=running 1=stopped
 python3 vmkit.py launch <group.json>     # 起一组 VM
 python3 vmkit.py stop <group.json>
 python3 vmkit.py build <distro> <spec.json>      # 分发 build_base
+python3 vmkit.py provision-cloud <spec.json>     # 起 cloud 镜像 VM 跑 provisioning
+python3 vmkit.py logfilter <brief|normal|verbose> < log   # 终端日志分级过滤
 python3 vmkit.py status [--dir DIR]      # 扫 *.pid 列运行中 VM
 ```
 
