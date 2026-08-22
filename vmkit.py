@@ -177,6 +177,30 @@ def assert_port_free(host: str, port: int) -> None:
         raise RuntimeError(f"端口 {host}:{port} 已被占用，可能有 VM 在跑")
 
 
+def make_seed_iso(out_iso: str, *, user_data: str, meta_data: str,
+                  volume_label: str = "cidata") -> str:
+    """把 cloud-init NoCloud 的 user-data/meta-data 内容打包成 seed ISO（mkisofs/genisoimage）。
+
+    内容由调用方拼好传入（字符串），vmkit 负责落盘 + 生成 ISO；返回 out_iso。
+    供 build_fedora_cloud 与外部 shell 编排（seed-iso CLI）共用。
+    """
+    mkiso = next((x for x in ("mkisofs", "genisoimage") if shutil.which(x)), None)
+    if not mkiso:
+        raise RuntimeError("需要 host 装 mkisofs 或 genisoimage 生成 cloud-init seed ISO")
+    d = tempfile.mkdtemp(prefix="vmkit-seed-")
+    try:
+        with open(os.path.join(d, "user-data"), "w") as f:
+            f.write(user_data)
+        with open(os.path.join(d, "meta-data"), "w") as f:
+            f.write(meta_data)
+        if subprocess.run([mkiso, "-quiet", "-o", out_iso,
+                           "-V", volume_label, "-R", "-J", d]).returncode:
+            raise RuntimeError(f"{mkiso} 生成 seed ISO 失败")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return out_iso
+
+
 class QemuVM:
     """启动/停止一个 QEMU VM(KVM;盘格式可配;串口走 unix socket 或 file)。
 
@@ -485,6 +509,18 @@ class SshConsole:
                 raise Timeout(f"ssh connect timeout to {self.dest}:{self.port}")
             time.sleep(1)
 
+    def wait_drop(self, timeout: float = 120.0) -> None:
+        """等 SSH 掉线（poll 直到连不上）；超时抛 Timeout。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self.run("true", timeout=3)[1] != 0:
+                    return
+            except Timeout:
+                return
+            time.sleep(2)
+        raise Timeout(f"ssh did not drop within {timeout}s: {self.dest}:{self.port}")
+
     def reboot_and_wait(self, *, verify: str | None = None,
                         drop_timeout: float = 120.0,
                         reconnect_timeout: float = 600.0,
@@ -494,14 +530,10 @@ class SshConsole:
             self.run("sudo reboot", timeout=10)
         except Timeout:
             pass
-        deadline = time.monotonic() + drop_timeout
-        while time.monotonic() < deadline:
-            try:
-                if self.run("true", timeout=3)[1] != 0:
-                    break
-            except Timeout:
-                break
-            time.sleep(2)
+        try:
+            self.wait_drop(timeout=drop_timeout)
+        except Timeout:
+            pass  # 掉线窗口没等到也继续回连（VM 可能已重启完）
         self.connect(timeout=reconnect_timeout)
         if verify is not None:
             out, rc = self.run(verify, timeout=verify_timeout)
@@ -735,23 +767,14 @@ def build_fedora_cloud(*, out_qcow2: str, release: int, arch: str = "x86_64",
         # 3) cloud-init NoCloud seed（可传入现成 seed ISO）
         iso = seed_iso
         if iso is None:
-            seed = os.path.join(tmp, "seed")
-            os.makedirs(seed)
-            with open(os.path.join(seed, "user-data"), "w") as f:
-                f.write("#cloud-config\n"
-                        f"users:\n  - name: {ssh_user}\n    groups: wheel\n"
-                        f"    sudo: \"ALL=(ALL) NOPASSWD: ALL\"\n"
-                        f"    ssh_authorized_keys:\n      - {pub}\n"
-                        "ssh_pwauth: false\ndisable_root: true\n")
-            with open(os.path.join(seed, "meta-data"), "w") as f:
-                f.write("instance-id: vmkit-fedora\nlocal-hostname: vmkit-fedora\n")
-            mkiso = next((x for x in ("mkisofs", "genisoimage")
-                          if shutil.which(x)), None)
-            if not mkiso:
-                raise RuntimeError("需要 host 装 mkisofs 或 genisoimage 生成 cloud-init seed ISO")
+            user_data = ("#cloud-config\n"
+                         f"users:\n  - name: {ssh_user}\n    groups: wheel\n"
+                         f"    sudo: \"ALL=(ALL) NOPASSWD: ALL\"\n"
+                         f"    ssh_authorized_keys:\n      - {pub}\n"
+                         "ssh_pwauth: false\ndisable_root: true\n")
+            meta_data = "instance-id: vmkit-fedora\nlocal-hostname: vmkit-fedora\n"
             iso = os.path.join(tmp, "seed.iso")
-            if subprocess.run([mkiso, "-quiet", "-o", iso, "-V", "cidata", "-R", "-J", seed]).returncode:
-                raise RuntimeError(f"{mkiso} 生成 seed ISO 失败")
+            make_seed_iso(iso, user_data=user_data, meta_data=meta_data)
 
         # 4) 起 VM(hostfwd 进 SSH),跑 provision,关机
         out, rc = provision_cloud_vm(
@@ -1114,6 +1137,32 @@ def _cli() -> int:
                     help="关闭 host key 校验(仅限可信/一次性环境)")
     es.add_argument("host"); es.add_argument("cmd")
 
+    # port-free:端口是否可绑定(复用 port_free,供 shell 编排做端口预检)
+    pf = sub.add_parser("port-free", help="端口是否可绑定（0=可绑定，1=已占用）")
+    pf.add_argument("--host", default="127.0.0.1")
+    pf.add_argument("--port", type=int, required=True)
+
+    # seed-iso:把 user-data/meta-data 内容打包成 NoCloud seed ISO
+    si = sub.add_parser("seed-iso", help="把 user-data/meta-data 内容打包成 cloud-init seed ISO")
+    si.add_argument("--out", required=True)
+    si.add_argument("--user-data", required=True, help="user-data 文件路径")
+    si.add_argument("--meta-data", required=True, help="meta-data 文件路径")
+    si.add_argument("--volume-label", default="cidata")
+
+    # ssh:SSH 编排原语(wait=等可连 / wait-drop=等掉线)
+    shp = sub.add_parser("ssh", help="SSH 编排原语（wait=等 SSH 可连，wait-drop=等 SSH 掉线）")
+    sshsub = shp.add_subparsers(dest="scmd", required=True)
+    sw = sshsub.add_parser("wait", help="等 SSH 可连（带退避），超时退出 1")
+    swd = sshsub.add_parser("wait-drop", help="等 SSH 掉线，超时退出 1")
+    for pp in (sw, swd):
+        pp.add_argument("--host", default="127.0.0.1")
+        pp.add_argument("--port", type=int, default=22)
+        pp.add_argument("--user", default="root")
+        pp.add_argument("--key")
+        pp.add_argument("--insecure", action="store_true",
+                        help="关闭 host key 校验(仅限可信/一次性环境)")
+        pp.add_argument("--timeout", type=float, default=120.0)
+
     ns = ap.parse_args(argv)
 
     if ns.cmd == "qemu":
@@ -1193,6 +1242,31 @@ def _cli() -> int:
                        strict_host_checking=not ns.insecure)
         out, rc = s.run(ns.cmd)
         print(out); print(f"[rc={rc}]")
+        return 0
+
+    if ns.cmd == "port-free":
+        return 0 if port_free(ns.host, ns.port) else 1
+
+    if ns.cmd == "seed-iso":
+        with open(ns.user_data, encoding="utf-8") as f:
+            user_data = f.read()
+        with open(ns.meta_data, encoding="utf-8") as f:
+            meta_data = f.read()
+        make_seed_iso(ns.out, user_data=user_data, meta_data=meta_data,
+                      volume_label=ns.volume_label)
+        return 0
+
+    if ns.cmd == "ssh":
+        s = SshConsole(ns.host, port=ns.port, user=ns.user, keyfile=ns.key,
+                       strict_host_checking=not ns.insecure)
+        try:
+            if ns.scmd == "wait":
+                s.connect(timeout=ns.timeout)
+            else:
+                s.wait_drop(timeout=ns.timeout)
+        except Timeout as e:
+            print(f"ssh {ns.scmd}: timeout: {e}", file=sys.stderr)
+            return 1
         return 0
 
     ap.print_help()
