@@ -117,5 +117,11 @@ python3 vmkit.py status [--dir DIR]      # 扫 *.pid 列运行中 VM
 - **非 Alpine 发行版**:`login_alpine` 是 Alpine 登录流程;其他发行版需自行实现等价的 `login_*`。
   串口驱动(`Console`/`run_cmd`)本身 OS 无关。
 
+## 开发:pre-commit 钩子
+自包含、零外部依赖(bash + python3 标准库),随仓库版本管理(`hooks/`):
+- 检测项:空白错误 / Python 语法(`ast.parse`,不落 `__pycache__`)/ 密钥 / 冲突标记 / 文件尾换行,仅扫暂存新增行。
+- 启用:`bash hooks/install.sh`(`core.hooksPath=hooks`,幂等);跳过:`git commit --no-verify`。
+- merge/rebase 进行中自动跳过(冲突标记为合法内容)。
+
 ## 环境要求
 host:Linux + `/dev/kvm`(用户可写)+ `qemu-system-x86_64` + `python3`。Alpine virt ISO(经 `.env` 的 `VMKIT_ISO` 指向)。

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# hooks/pre-commit —— 暂存内容预提交检测（零外部依赖：bash + python3 标准库）
+#
+#   检测项（只针对 git diff --cached 的暂存内容）：
+#     1. 空白错误        git diff --cached --check（trailing whitespace / space-before-tab / blank-at-eof）
+#     2. python 语法     *.py 用 ast.parse 校验（不落盘 __pycache__）
+#     3. 密钥扫描        仅扫描本次【新增行】的高信号密钥模式（私钥块/AWS/GitHub/Slack/API token 赋值等）
+#     4. 冲突标记        新增行里的 <<<<<<< / ======= / >>>>>>>
+#     5. 文件尾换行      暂存内容末尾缺换行
+#
+#   跳过：merge/rebase 进行中（冲突标记合法）；git commit --no-verify 由 git 自行绕过。
+#   说明：密钥只扫新增行，仓库里已提交的历史遗留不会反复拦截无关改动。
+#   说明：本仓库为纯 Python（vmkit.py + tests/），无 bash 检测段；将来引入 shell 脚本时补回。
+set -uo pipefail
+
+# ---- 跳过场景：merge/rebase 中冲突标记是合法内容 ----
+GDIR="$(git rev-parse --git-dir)"
+if [ -f "$GDIR/MERGE_HEAD" ] || [ -d "$GDIR/rebase-merge" ] || [ -d "$GDIR/rebase-apply" ]; then
+    exit 0
+fi
+
+# ---- 暂存文件清单（新增/复制/修改；二进制跳过）----
+# 二进制用 git --numstat 判定（二进制行 add/del 为 -；不要用 grep $'\x00'，
+# bash 变量存不了 NUL，$'\x00' 会展开成空串导致全部误判为二进制）。
+TEXT=()
+while IFS=$'\t' read -r add del fname; do
+    [ "$add" = "-" ] && continue      # 二进制
+    [ -f "$fname" ] || continue
+    TEXT+=("$fname")
+done < <(git diff --cached --numstat --diff-filter=ACM)
+[ "${#TEXT[@]}" -eq 0 ] && exit 0
+
+fail=0
+report() { printf 'pre-commit: %s\n' "$*" >&2; fail=1; }
+
+# ---- 1. 空白错误（git 内置）----
+if ! git diff --cached --check; then
+    report "空白错误（trailing whitespace / space-before-tab / blank-at-eof），见上"
+fi
+
+# ---- 2. python 语法（ast.parse 不写 __pycache__）----
+PY_FILES=()
+for f in "${TEXT[@]}"; do
+    case "$f" in
+        *.py) PY_FILES+=("$f") ;;
+    esac
+done
+if [ "${#PY_FILES[@]}" -gt 0 ] && \
+   ! python3 -c 'import ast,sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' "${PY_FILES[@]}"; then
+    report "python 语法错误（见上）"
+fi
+
+# ---- 3/4/5. 密钥 + 冲突标记 + 文件尾换行（python 扫新增行）----
+if ! python3 - "${TEXT[@]}" <<'PYEOF'
+import re, subprocess, sys
+
+# 高信号密钥模式：宁可漏报不误报，只匹配"显然就是密钥"的形态
+SECRETS = [
+    re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY(?: BLOCK)?-----'),
+    re.compile(r'\bAKIA[0-9A-Z]{16}\b'),                        # AWS access key
+    re.compile(r'\bgh[pousr]_[A-Za-z0-9]{20,}\b'),              # GitHub PAT
+    re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b'),            # Slack token
+    re.compile(r'\bsk-[A-Za-z0-9]{20,}\b'),                     # OpenAI/Anthropic 风格 key
+    re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'),                   # Google API key
+    re.compile(r'\b[A-Za-z0-9]{16,}:[A-Za-z0-9]{16,}@[^\s"\']+\b'),  # user:pass@host
+    re.compile(r'\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|token)'
+               r'\s*[:=]\s*[\'"][^\'"]{8,}[\'"]', re.I),        # 常见 key= "值" 赋值
+]
+CONFLICT = re.compile(r'^(<<<<<<<|>>>>>>>)')
+CONFLICT_SEP = re.compile(r'^=======$')
+HUNK = re.compile(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
+
+def scan_added_lines():
+    """解析 git diff --cached -U0，只对新增行做密钥/冲突标记检测，输出 file:line。"""
+    diff = subprocess.run(['git', 'diff', '--cached', '-U0'],
+                          capture_output=True, text=True).stdout
+    cur, line, errors = None, 0, 0
+    for raw in diff.splitlines():
+        if raw.startswith('+++ b/'):
+            cur, line = raw[6:], 0
+            continue
+        if raw.startswith('@@'):
+            m = HUNK.match(raw)
+            line = int(m.group(1)) - 1 if m else 0
+            continue
+        if raw.startswith('+') and not raw.startswith('+++'):
+            line += 1
+            body = raw[1:]
+            for pat in SECRETS:
+                if pat.search(body):
+                    print(f'{cur}:{line}: 疑似密钥（{pat.pattern.splitlines()[0][:40]}）')
+                    errors += 1
+                    break
+            if CONFLICT.match(body) or CONFLICT_SEP.match(body):
+                print(f'{cur}:{line}: 冲突标记')
+                errors += 1
+    return errors
+
+def scan_final_newline(files):
+    """暂存内容末尾缺换行（git show :path 读暂存 blob，避免与工作区未暂存改动混淆）。"""
+    errors = 0
+    for f in files:
+        blob = subprocess.run(['git', 'show', ':' + f], capture_output=True).stdout
+        if blob and not blob.endswith(b'\n'):
+            print(f'{f}: 文件尾缺换行')
+            errors += 1
+    return errors
+
+errors = scan_added_lines() + scan_final_newline(sys.argv[1:])
+sys.exit(1 if errors else 0)
+PYEOF
+then
+    report "密钥/冲突标记/换行扫描发现问题（见上；确认无误可用 git commit --no-verify 绕过）"
+fi
+
+exit "$fail"
